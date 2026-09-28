@@ -10776,8 +10776,10 @@ bool ha_innobase::custom_index_ref_to_row(uint keynr, uint64_t key_ref,
     return true;
   }
 
-  // Step 1: resolve the extension's column reference to the owning row's
-  // clustered field-0 bytes (InnoDB native format), copied into a local buffer.
+  // Step 1: resolve the extension's column reference to the owning row's packed
+  // row reference -- the clustered primary-key fields in pack_row_ref()'s
+  // hand-rolled format (see custom_column.cc) -- copied into a local buffer. The
+  // extension caps the packed size at its ROWID_MAX, well under this buffer.
   unsigned char rowid_buf[REC_MAX_N_FIELDS * sizeof(uint64_t)];
   uint32_t rowid_len = 0;
   if (villagesql::innodb::Custom_index::col_ref_to_rowid(
@@ -10801,17 +10803,49 @@ bool ha_innobase::custom_index_ref_to_row(uint keynr, uint64_t key_ref,
     build_template(false);
   }
 
-  // Step 3: build the clustered search tuple directly from the native field-0
-  // bytes. Unlike index_read()'s key path we do NOT call
-  // row_sel_convert_mysql_key_to_innobase: rowid_buf is already in InnoDB
-  // clustered-storage format (it was snapshotted from a clustered record), so
-  // it goes straight into field 0. Field 0 is the clustered index's unique key
-  // for a single-column PK, or the hidden DB_ROW_ID for a PK-less table.
+  // Step 3: unpack the packed row reference into the clustered search tuple.
+  // rowid_buf is pack_row_ref()'s hand-rolled format: for each of the n_uniq
+  // clustered key fields, in key order, a fixed-length field is stored as raw
+  // bytes (size known from the descriptor) and a variable-length field as
+  // [len:4][bytes]. Clustered key fields are NOT NULL, so there is no null
+  // encoding. Walk the same descriptor to carve the blob back into fields.
+  // Handles a composite primary key and variable-length key columns; for a
+  // PK-less table the single field is the synthetic DB_ROW_ID. The field data
+  // points into rowid_buf, which outlives the clustered lookup below.
+  const uint16_t n_uniq = dict_index_get_n_unique(clust);
+  const ulint comp = dict_table_is_comp(clust->table);
+
+  mem_heap_t *ref_heap = mem_heap_create(256, UT_LOCATION_HERE);
   dtuple_t *search_tuple = m_prebuilt->search_tuple;
-  dict_index_copy_types(search_tuple, clust, clust->n_fields);
-  dtuple_set_n_fields(search_tuple, 1);
-  dfield_t *dfield = dtuple_get_nth_field(search_tuple, 0);
-  dfield_set_data(dfield, rowid_buf, rowid_len);
+  dtuple_set_n_fields(search_tuple, n_uniq);
+  dict_index_copy_types(search_tuple, clust, n_uniq);
+  dtuple_set_info_bits(search_tuple, REC_STATUS_ORDINARY);
+
+  const unsigned char *p = rowid_buf;
+  const unsigned char *end = rowid_buf + rowid_len;
+  for (uint16_t i = 0; i < n_uniq; i++) {
+    ulint field_len = clust->get_col(i)->get_fixed_size(comp);
+    if (field_len == 0) {  // variable-length: read the 4-byte length prefix
+      if (p + sizeof(uint32_t) > end) {
+        mem_heap_free(ref_heap);
+        snprintf(error_msg, error_msg_len,
+                 "custom_index_ref_to_row: truncated row reference at field %u",
+                 i);
+        return true;
+      }
+      field_len = mach_read_from_4(p);
+      p += sizeof(uint32_t);
+    }
+    if (p + field_len > end) {
+      mem_heap_free(ref_heap);
+      snprintf(error_msg, error_msg_len,
+               "custom_index_ref_to_row: truncated row reference at field %u",
+               i);
+      return true;
+    }
+    dfield_set_data(dtuple_get_nth_field(search_tuple, i), p, field_len);
+    p += field_len;
+  }
 
   // Step 4: exact clustered lookup into buf.
   m_prebuilt->m_mysql_handler = this;
@@ -10820,6 +10854,8 @@ bool ha_innobase::custom_index_ref_to_row(uint keynr, uint64_t key_ref,
     ret = row_search_mvcc(buf, PAGE_CUR_GE, m_prebuilt, ROW_SEL_EXACT, 0);
     innobase_srv_conc_exit_innodb(m_prebuilt);
   }
+
+  mem_heap_free(ref_heap);
 
   if (ret == DB_RECORD_NOT_FOUND) {
     // The reference resolved, but the row is not visible to this transaction's

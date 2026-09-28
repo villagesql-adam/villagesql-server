@@ -33,6 +33,8 @@
 #include "storage/innobase/include/log0chkp.h"
 #include "storage/innobase/include/mem0mem.h"
 #include "storage/innobase/include/mtr0mtr.h"
+#include "storage/innobase/include/data0data.h"
+#include "storage/innobase/include/rem0rec.h"
 #include "storage/innobase/include/rem0types.h"
 #include "storage/innobase/include/row0log.h"
 #include "storage/innobase/include/row0upd.h"
@@ -389,18 +391,105 @@ dberr_t Custom_column::drop(const dict_table_t *table, trx_id_t trx_id) {
   return DB_SUCCESS;
 }
 
+// Packs the owning row's identity -- the clustered index's first n_uniq fields
+// (the primary key, or the synthetic DB_ROW_ID for a PK-less table) -- into an
+// opaque byte string the column store keeps per entry and later hands back to
+// col_ref_to_rowid(). @p ref is a tuple of exactly the n_uniq clustered key
+// fields.
+//
+// This is a hand-rolled format, deliberately NOT an InnoDB physical record
+// (rec_convert_dtuple_to_rec). The rec codec is coupled to the table's
+// row-version / instant-column state (current_row_version, is_store_version):
+// serializing a key prefix against a version-evolved clustered index trips that
+// machinery and asserts. A row reference must be immune to how the table's
+// columns evolved, so we serialize just the key bytes ourselves.
+//
+// Format, per field in key order (clustered key fields are NOT NULL by
+// definition, so there is no null encoding):
+//   fixed-length field    -> [ bytes : fixed_size ]        (no length prefix --
+//                                                            the descriptor knows
+//                                                            the size)
+//   variable-length field -> [ len : 4 ][ bytes : len ]
+// An all-fixed composite PK (the common case) is therefore pure concatenation
+// with zero framing. custom_index_ref_to_row() is the inverse; both sides walk
+// the same clustered descriptor field by field, so they stay in lockstep.
+//
+// Size is bounded at the extension by can_store_key(), so this only packs.
+// Writes {data, length} into @p out (allocated from @p heap).
+static void pack_row_ref(const dict_index_t *clust, const dtuple_t *ref,
+                         mem_heap_t *heap, Custom_column::Data *out) {
+  const uint16_t n_uniq = dict_index_get_n_unique(clust);
+  const ulint comp = dict_table_is_comp(clust->table);
+
+  // First pass: total size.
+  ulint blob_size = 0;
+  for (uint16_t i = 0; i < n_uniq; i++) {
+    const dfield_t *f = dtuple_get_nth_field(ref, i);
+    const ulint len = dfield_get_len(f);
+    ut_ad(len != UNIV_SQL_NULL);  // clustered key fields are NOT NULL
+    if (clust->get_col(i)->get_fixed_size(comp) == 0) {
+      blob_size += sizeof(uint32_t);  // variable-length: 4-byte length prefix
+    }
+    blob_size += len;
+  }
+
+  auto *blob = static_cast<byte *>(mem_heap_alloc(heap, blob_size));
+  byte *p = blob;
+  for (uint16_t i = 0; i < n_uniq; i++) {
+    const dfield_t *f = dtuple_get_nth_field(ref, i);
+    const ulint len = dfield_get_len(f);
+    if (clust->get_col(i)->get_fixed_size(comp) == 0) {
+      mach_write_to_4(p, static_cast<uint32_t>(len));
+      p += sizeof(uint32_t);
+    }
+    if (len > 0) memcpy(p, dfield_get_data(f), len);
+    p += len;
+  }
+  ut_ad(static_cast<ulint>(p - blob) == blob_size);
+
+  out->data = blob;
+  out->length = static_cast<uint32_t>(blob_size);
+}
+
+// Builds the n_uniq-field clustered key tuple from a clustered record and packs
+// it via pack_row_ref(). dict_index_build_data_tuple copies the key prefix
+// (types and field data) from the record via rec_copy_prefix_to_dtuple. It also
+// copies the source record's info/status bits, which for an instant/versioned
+// leaf record carry the INSTANT/VERSION status; reset to REC_STATUS_ORDINARY,
+// since the packed ref is a plain n_uniq-field key record with no instant-column
+// layout of its own (otherwise rec_get_serialize_size asserts has_instant_cols).
+static void pack_row_ref_from_rec(const dict_index_t *clust, const rec_t *rec,
+                                  mem_heap_t *heap, Custom_column::Data *out) {
+  const uint16_t n_uniq = dict_index_get_n_unique(clust);
+  dtuple_t *ref = dict_index_build_data_tuple(
+      const_cast<dict_index_t *>(clust), const_cast<rec_t *>(rec), n_uniq, heap);
+  dtuple_set_info_bits(ref, REC_STATUS_ORDINARY);
+  pack_row_ref(clust, ref, heap, out);
+}
+
+// Builds the n_uniq-field clustered key tuple from a clustered row tuple (whose
+// first n_uniq fields are the key) and packs it via pack_row_ref().
+static void pack_row_ref_from_tuple(const dict_index_t *clust,
+                                    const dtuple_t *row, mem_heap_t *heap,
+                                    Custom_column::Data *out) {
+  const uint16_t n_uniq = dict_index_get_n_unique(clust);
+  dtuple_t *ref = dtuple_create(heap, n_uniq);
+  dict_index_copy_types(ref, clust, n_uniq);
+  dtuple_set_info_bits(ref, REC_STATUS_ORDINARY);
+  for (uint16_t i = 0; i < n_uniq; i++) {
+    *dtuple_get_nth_field(ref, i) = *dtuple_get_nth_field(row, i);
+  }
+  pack_row_ref(clust, ref, heap, out);
+}
+
 static dberr_t insert_in_column_store(const dict_col_t *col, mtr_t *mtr,
                                       trx_id_t trx_id, const dfield_t *field,
-                                      const dfield_t *pk_field,
+                                      const Custom_column::Data &pk_data,
                                       Custom_column::Ref &ref) {
   ulint col_data_len = 0;
   Custom_column::Data col_data{};
   col_data.data = field->get_extended_data(col_data_len);
   col_data.length = static_cast<uint32_t>(col_data_len);
-
-  Custom_column::Data pk_data{
-      static_cast<const unsigned char *>(pk_field->data),
-      static_cast<uint32_t>(pk_field->len)};
 
   if (!col_data.data || col_data.length == 0) {
     ib::error(ER_VILLAGESQL_GENERIC_MESSAGE)
@@ -457,16 +546,18 @@ static dberr_t insert_impl(const dict_index_t *index, uint32_t index_field_num,
   dict_col_t *col = ind_field->col;
   ut_a(col->stored_by_extn());
 
-  // Extract the primary key from field 0 of the current record.
-  ulint pk_len = 0;
-  ulint pk_off = rec_get_nth_field_offs(index, offsets, 0, &pk_len);
-  dfield_t pk_field;
-  dfield_set_data(&pk_field, rec + pk_off, pk_len);
+  // Pack the owning row's primary key (the clustered index's n_uniq key fields)
+  // as the opaque row reference the column store keeps for this entry.
+  if (*heap == nullptr) {
+    *heap = mem_heap_create(1024, UT_LOCATION_HERE);
+  }
+  Custom_column::Data pk_data{};
+  pack_row_ref_from_rec(index, rec, *heap, &pk_data);
 
   // Insert into column storage and get reference value
   Custom_column::Ref ref_val = Custom_column::EMPTY_REF;
   auto error =
-      insert_in_column_store(col, &mtr, trx_id, data_field, &pk_field, ref_val);
+      insert_in_column_store(col, &mtr, trx_id, data_field, pk_data, ref_val);
   if (error != DB_SUCCESS) {
     mtr_commit(&mtr);
     return error;
@@ -547,7 +638,11 @@ dberr_t Custom_column::insert_direct(dict_table_t *table, trx_id_t trx_id,
   dict_index_t *index = table->first_index();
   ut_a(index->is_clustered());
 
-  const dfield_t *pk_field = dtuple_get_nth_field(tuple, 0);
+  // Pack the owning row's primary key (the clustered index's n_uniq key fields)
+  // once; every extended column in this row shares the same row reference.
+  mem_heap_t *ref_heap = mem_heap_create(1024, UT_LOCATION_HERE);
+  Custom_column::Data pk_data{};
+  pack_row_ref_from_tuple(index, tuple, ref_heap, &pk_data);
 
   for (uint32_t i = 0; i < tuple->n_fields; i++) {
     dfield_t *field = dtuple_get_nth_field(tuple, i);
@@ -567,15 +662,17 @@ dberr_t Custom_column::insert_direct(dict_table_t *table, trx_id_t trx_id,
 
     Custom_column::Ref ref_val = Custom_column::EMPTY_REF;
     auto err =
-        insert_in_column_store(col, &mtr, trx_id, field, pk_field, ref_val);
+        insert_in_column_store(col, &mtr, trx_id, field, pk_data, ref_val);
     mtr_commit(&mtr);
 
     if (err != DB_SUCCESS) {
       log_extended_error("Insert", nullptr, index, i);
+      mem_heap_free(ref_heap);
       return err;
     }
     field->set_extended_ref(ref_val);
   }
+  mem_heap_free(ref_heap);
   return DB_SUCCESS;
 }
 
