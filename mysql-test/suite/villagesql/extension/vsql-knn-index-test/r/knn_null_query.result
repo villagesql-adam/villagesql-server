@@ -1,0 +1,32 @@
+INSTALL EXTENSION vsql_knn_index_test;
+CREATE TABLE t (id INT PRIMARY KEY, v KVECTOR);
+CREATE INDEX idx_v ON t (v)
+USING EXTENDED(vsql_knn_index_test.kvec_l2);
+INSERT INTO t VALUES
+(1, '[1,0,0,0]'),
+(2, '[0,1,0,0]'),
+(3, '[0,0,1,0]');
+# NULL query with LIMIT: does not route (falls back to a Sort), then the
+# distance function rejects the NULL operand. Must not crash.
+EXPLAIN FORMAT=tree
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, NULL) LIMIT 3;
+EXPLAIN
+-> Limit: 3 row(s)
+    -> Sort: vsql_knn_index_test.kvec_l2_distance(t.v,NULL), limit input to 3 row(s) per chunk
+        -> Stream results  (cost=COST rows=ROWS)
+            -> Table scan on t  (cost=COST rows=ROWS)
+
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, NULL) LIMIT 3;
+ERROR HY000: VDF error in function 'kvec_l2_distance': kvec_l2_distance: operand too short
+# NULL query without LIMIT: also does not route; same outcome.
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, NULL);
+ERROR HY000: VDF error in function 'kvec_l2_distance': kvec_l2_distance: operand too short
+# Empty query string is rejected as a KVECTOR value before the query runs.
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, '') LIMIT 3;
+ERROR HY000: Incorrect kvector value: ''
+DROP TABLE t;
+UNINSTALL EXTENSION vsql_knn_index_test;

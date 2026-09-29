@@ -197,6 +197,10 @@ bool RecognizeKnnOrderItem(TABLE *table, Item *order_item, uint *key_idx,
                                 key_idx)) {
     return true;
   }
+
+  // A NULL query vector cannot drive a distance scan; reject the plan.
+  if (query_item->is_null()) return true;
+
   *query_item_out = query_item;
   return false;
 }

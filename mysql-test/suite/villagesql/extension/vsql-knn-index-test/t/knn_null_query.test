@@ -1,0 +1,40 @@
+# A NULL or empty query vector in a KNN ORDER BY ... LIMIT must not crash.
+#
+# A NULL query cannot drive the index, so the query falls back to a plain scan +
+# sort and the distance function then rejects the NULL operand. An empty string
+# is rejected as a KVECTOR value before it reaches the query at all. Regression
+# for a server crash where a NULL query was routed to a distance scan and left a
+# null access path.
+
+INSTALL EXTENSION vsql_knn_index_test;
+
+CREATE TABLE t (id INT PRIMARY KEY, v KVECTOR);
+CREATE INDEX idx_v ON t (v)
+  USING EXTENDED(vsql_knn_index_test.kvec_l2);
+INSERT INTO t VALUES
+  (1, '[1,0,0,0]'),
+  (2, '[0,1,0,0]'),
+  (3, '[0,0,1,0]');
+
+--echo # NULL query with LIMIT: does not route (falls back to a Sort), then the
+--echo # distance function rejects the NULL operand. Must not crash.
+--replace_regex /cost=[0-9.e+-]+/cost=COST/ /rows=[0-9.e+-]+/rows=ROWS/
+EXPLAIN FORMAT=tree
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, NULL) LIMIT 3;
+--error ER_UDF_ERROR
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, NULL) LIMIT 3;
+
+--echo # NULL query without LIMIT: also does not route; same outcome.
+--error ER_UDF_ERROR
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, NULL);
+
+--echo # Empty query string is rejected as a KVECTOR value before the query runs.
+--error ER_WRONG_VALUE
+SELECT id FROM t
+ORDER BY vsql_knn_index_test.kvec_l2_distance(v, '') LIMIT 3;
+
+DROP TABLE t;
+UNINSTALL EXTENSION vsql_knn_index_test;
