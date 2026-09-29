@@ -238,7 +238,8 @@ class CustomKnnDistanceIterator final : public TableRowIterator {
 
   ~CustomKnnDistanceIterator() override { custom_index_knn_scan_end(&m_scan); }
 
-  bool Init() override {
+ private:
+  bool DoInit() override {
     custom_index_knn_scan_end(&m_scan);
     int error = 0;
     // Random-read init: the REF_LOOKUP fetch (custom_index_ref_to_row) does its
@@ -267,7 +268,7 @@ class CustomKnnDistanceIterator final : public TableRowIterator {
     return false;
   }
 
-  int Read() override {
+  int DoRead() override {
     for (;;) {
       uint64_t key_ref = 0;
       bool eof = false;
@@ -305,7 +306,6 @@ class CustomKnnDistanceIterator final : public TableRowIterator {
     }
   }
 
- private:
   uchar *const m_record;
   const int m_key_idx;
   const CustomKnnDistanceScanSpec *const m_spec;
