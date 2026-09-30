@@ -168,6 +168,20 @@ Use `./scripts/villint.sh` to lint changed files in your PR/branch. It runs clan
 
 For additional options, see `./scripts/villint.sh --help`.
 
+The linter needs clang-format 22.1 and refuses any other version. Do not use Homebrew's `clang-format` package, because it is a newer version. Install it with `pipx`:
+
+```bash
+# macOS
+brew install pipx
+
+# Linux (Ubuntu/Debian)
+sudo apt-get install pipx
+
+# Both
+pipx install "clang-format==22.1.*"
+pipx ensurepath
+```
+
 ## Architecture Overview
 
 TODO(villagesql-general): Add VillageSQL-specific architecture documentation covering:
