@@ -168,7 +168,7 @@ Use `./scripts/villint.sh` to lint changed files in your PR/branch. It runs clan
 
 For additional options, see `./scripts/villint.sh --help`.
 
-The linter needs clang-format 22.1 and refuses any other version. Do not use Homebrew's `clang-format` package, because it is a newer version. Install it with `pipx`:
+The linter needs one exact clang-format version, and it refuses any other. Homebrew and Linux package managers ship whatever version they currently carry, so do not install clang-format from them. Install the exact version with `pipx`:
 
 ```bash
 # macOS
@@ -179,7 +179,7 @@ sudo apt-get install pipx
 
 # Both
 pipx install "clang-format==22.1.*"
-pipx ensurepath
+pipx ensurepath   # adds ~/.local/bin to PATH in your shell startup file; open a new shell after
 ```
 
 ## Architecture Overview
