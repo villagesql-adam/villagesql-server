@@ -271,9 +271,10 @@ struct has_check_signature<
     : std::true_type {};
 
 template <typename Ext, size_t... Is>
-char *vef_check_func_signatures(const Ext &e, std::index_sequence<Is...>) {
+const char *vef_check_func_signatures(const Ext &e,
+                                      std::index_sequence<Is...>) {
   static char error_buf[512];
-  char *invalid = nullptr;
+  const char *invalid = nullptr;
   auto check_one = [&invalid](const auto &func) {
     if (invalid) return;
     using F = std::decay_t<decltype(func)>;
@@ -357,11 +358,13 @@ vef_registration_t *vef_register_impl(
   }
 
   if constexpr (FuncCount > 0) {
-    char *invalid_signature =
+    const char *invalid_signature =
         vef_check_func_signatures(ext, std::make_index_sequence<FuncCount>{});
     if (invalid_signature) {
+      static char error_buf[256];
+      snprintf(error_buf, sizeof(error_buf), "%s", invalid_signature);
       reg.protocol = arg->protocol;
-      reg.error_msg = invalid_signature;
+      reg.error_msg = error_buf;
       return &reg;
     }
 
